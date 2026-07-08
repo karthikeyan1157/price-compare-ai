@@ -1,0 +1,635 @@
+     1→     1→import { NextRequest, NextResponse } from 'next/server';
+     2→     2→import { db } from '@/lib/db';
+     3→     3→import { callLLM, webSearch, readWebPage, parseJSONResponse } from '@/lib/zai';
+     4→     4→import { extractPricesFromText, calculateDealScore, detectProductCategory, generateSearchSuggestions } from '@/lib/price-engine';
+     5→     5→import type {
+     6→     6→  ProductSearchResult,
+     7→     7→  StoreListing,
+     8→     8→  PriceHistoryPoint,
+     9→     9→  Coupon,
+    10→    10→  ReviewSummary,
+    11→    11→  FakeDiscountAlert,
+    12→    12→  PricePrediction,
+    13→    13→} from '@/types';
+    14→    14→
+    15→    15→export const runtime = 'nodejs';
+    16→    16→export const maxDuration = 90;
+    17→    17→
+    18→    18→const searchCache = new Map<string, { result: ProductSearchResult; timestamp: number }>();
+    19→    19→const CACHE_TTL = 3 * 60 * 1000;
+    20→    20→
+    21→    21→function generateId(): string {
+    22→    22→  return `sr-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+    23→    23→}
+    24→    24→
+    25→    25→function sleep(ms: number): Promise<void> {
+    26→    26→  return new Promise(r => setTimeout(r, ms));
+    27→    27→}
+    28→    28→
+    29→    29→// ---- Store Detection ----
+    30→    30→
+    31→    31→const STORE_DOMAIN_MAP: Record<string, string> = {
+    32→    32→  'amazon.in': 'Amazon', 'flipkart.com': 'Flipkart', 'croma.com': 'Croma',
+    33→    33→  'reliancedigital.com': 'Reliance Digital', 'tatacliq.com': 'Tata CLiQ',
+    34→    34→  'vijaysales.com': 'Vijay Sales', 'myntra.com': 'Myntra', 'snapdeal.com': 'Snapdeal',
+    35→    35→  'apple.com': 'Apple', 'samsung.com': 'Samsung', 'meesho.com': 'Meesho',
+    36→    36→  'nykaa.com': 'Nykaa', 'ajio.com': 'Ajio', 'paytmmall.com': 'Paytm Mall',
+    37→    37→  'bajajfinservmarkets.in': 'Bajaj Mall', 'mi.com': 'Mi Store',
+    38→    38→  'oneplus.com': 'OnePlus Store', 'realme.com': 'Realme Store',
+    39→    39→  'poorvika.com': 'Poorvika', 'shopclues.com': 'ShopClues', 'infibeam.com': 'Infibeam',
+    40→    40→};
+    41→    41→
+    42→    42→const COMPARISON_DOMAINS = [
+    43→    43→  '91mobiles.com', 'smartprix.com', 'pricedekho.com',
+    44→    44→  'gadgets360.com', 'mysmartprice.com', 'buyhatke.com',
+    45→    45→];
+    46→    46→
+    47→    47→function detectStoreFromUrl(url: string): string {
+    48→    48→  try {
+    49→    49→    const host = (new URL(url).hostname || '').toLowerCase().replace(/^www\./, '');
+    50→    50→    for (const [domain, name] of Object.entries(STORE_DOMAIN_MAP)) {
+    51→    51→      if (host.includes(domain)) return name;
+    52→    52→    }
+    53→    53→    const parts = host.split('.');
+    54→    54→    return parts[0] ? parts[0].charAt(0).toUpperCase() + parts[0].slice(1) : 'Store';
+    55→    55→  } catch { return 'Store'; }
+    56→    56→}
+    57→    57→
+    58→    58→function isComparisonSite(url: string): boolean {
+    59→    59→  try {
+    60→    60→    const host = new URL(url).hostname.toLowerCase();
+    61→    61→    return COMPARISON_DOMAINS.some(d => host.includes(d));
+    62→    62→  } catch { return false; }
+    63→    63→}
+    64→    64→
+    65→    65→function isStoreUrl(url: string): boolean {
+    66→    66→  try {
+    67→    67→    const host = new URL(url).hostname.toLowerCase().replace(/^www\./, '');
+    68→    68→    return Object.keys(STORE_DOMAIN_MAP).some(d => host.includes(d));
+    69→    69→  } catch { return false; }
+    70→    70→}
+    71→    71→
+    72→    72→function getLogoForStore(store: string): string {
+    73→    73→  const map: Record<string, string> = {
+    74→    74→    'amazon': 'https://logo.clearbit.com/amazon.in', 'flipkart': 'https://logo.clearbit.com/flipkart.com',
+    75→    75→    'croma': 'https://logo.clearbit.com/croma.com', 'reliance digital': 'https://logo.clearbit.com/reliancedigital.com',
+    76→    76→    'tata cliq': 'https://logo.clearbit.com/tatacliq.com', 'vijay sales': 'https://logo.clearbit.com/vijaysales.com',
+    77→    77→    'apple': 'https://logo.clearbit.com/apple.com', 'samsung': 'https://logo.clearbit.com/samsung.com',
+    78→    78→    'myntra': 'https://logo.clearbit.com/myntra.com', 'snapdeal': 'https://logo.clearbit.com/snapdeal.com',
+    79→    79→    'meesho': 'https://logo.clearbit.com/meesho.com', 'nykaa': 'https://logo.clearbit.com/nykaa.com',
+    80→    80→    'ajio': 'https://logo.clearbit.com/ajio.com', 'pricedekho': 'https://logo.clearbit.com/pricedekho.com',
+    81→    81→    '91mobiles': 'https://logo.clearbit.com/91mobiles.com', 'gadgets360': 'https://logo.clearbit.com/gadgets360.com',
+    82→    82→    'smartprix': 'https://logo.clearbit.com/smartprix.com', 'mysmartprice': 'https://logo.clearbit.com/mysmartprice.com',
+    83→    83→    'oneplus store': 'https://logo.clearbit.com/oneplus.com', 'mi store': 'https://logo.clearbit.com/mi.com',
+    84→    84→  };
+    85→    85→  const key = store.toLowerCase().trim();
+    86→    86→  if (map[key]) return map[key];
+    87→    87→  for (const [k, v] of Object.entries(map)) {
+    88→    88→    if (key.includes(k) || k.includes(key)) return v;
+    89→    89→  }
+    90→    90→  return `https://logo.clearbit.com/${key.replace(/\s+/g, '')}.com`;
+    91→    91→}
+    92→    92→
+    93→    93→function findStoreUrl(results: Array<{ url: string }>, store: string): string | null {
+    94→    94→  const domains: Record<string, string[]> = {
+    95→    95→    'amazon': ['amazon.in'], 'flipkart': ['flipkart.com'], 'croma': ['croma.com'],
+    96→    96→    'reliance digital': ['reliancedigital.com'], 'tata cliq': ['tatacliq.com'],
+    97→    97→    'vijay sales': ['vijaysales.com'], 'snapdeal': ['snapdeal.com'],
+    98→    98→    'myntra': ['myntra.com'], 'ajio': ['ajio.com'], 'apple': ['apple.com'],
+    99→    99→    'samsung': ['samsung.com'], 'nykaa': ['nykaa.com'], 'meesho': ['meesho.com'],
+   100→   100→  };
+   101→   101→  const ds = domains[store.toLowerCase()];
+   102→   102→  if (!ds) return null;
+   103→   103→  for (const r of results) {
+   104→   104→    try {
+   105→   105→      const h = new URL(r.url).hostname.toLowerCase();
+   106→   106→      if (ds.some(d => h.includes(d))) return r.url;
+   107→   107→    } catch { /* skip */ }
+   108→   108→  }
+   109→   109→  return null;
+   110→   110→}
+   111→   111→
+   112→   112→// ---- LLM: Extract prices from comparison site page ----
+   113→   113→
+   114→   114→interface ExtractedPrice {
+   115→   115→  store: string;
+   116→   116→  price: number;
+   117→   117→  originalPrice?: number;
+   118→   118→  isExchange: boolean;
+   119→   119→}
+   120→   120→
+   121→   121→async function extractComparisonPricesLLM(
+   122→   122→  pageText: string, productName: string
+   123→   123→): Promise<ExtractedPrice[]> {
+   124→   124→  try {
+   125→   125→    const textSlice = pageText.slice(0, 10000);
+   126→   126→    const prompt = `You are a price extraction expert for Indian e-commerce. Extract the ACTUAL DISCOUNTED SELLING PRICE for "${productName}" from this comparison page.
+   127→   127→
+   128→   128→CRITICAL RULES:
+   129→   129→1. "price" field = the DISCOUNTED/OFFER/SELLING price (the LOWER price the customer actually pays)
+   130→   130→2. "originalPrice" field = the MRP/listed price (the HIGHER price shown with strikethrough)
+   131→   131→3. NEVER return MRP as "price" — MRP goes in "originalPrice" only
+   132→   132→4. If you see "₹79,900" (MRP, strikethrough) and "₹64,999" (selling price), return: price=64999, originalPrice=79900
+   133→   133→5. "Exchange Price" or "With Exchange" or "Effective Price" → set isExchange=true
+   134→   134→6. Do NOT return "effective price after bank offer" or "cashback price" as the main price
+   135→   135→
+   136→   136→STORE-SPECIFIC NOTES:
+   137→   137→- Amazon: Usually shows MRP crossed out, then a lower "Deal Price" or just "₹X" — the lower number is the selling price
+   138→   138→- Vijay Sales: Shows "MRP" crossed out and "Selling Price" or "Offer Price" — use the offer/selling price
+   139→   139→- Flipkart: Shows "₹X" as the selling price (MRP is crossed out above)
+   140→   140→
+   141→   141→Known stores: Amazon, Flipkart, Croma, Reliance Digital, Tata CLiQ, Vijay Sales, Snapdeal, etc.
+   142→   142→
+   143→   143→Return JSON array: [{"store":"Amazon","price":64999,"originalPrice":79900,"isExchange":false}]
+   144→   144→If none found: []`;
+   145→   145→
+   146→   146→    const result = await callLLM([
+   147→   147→      { role: 'system', content: 'Extract DISCOUNTED selling prices from Indian comparison sites. NEVER return MRP as the main price. Return ONLY JSON. Never fabricate.' },
+   148→   148→      { role: 'user', content: `${prompt}\n\nPAGE:\n${textSlice}` },
+   149→   149→    ], 1.5);
+   150→   150→
+   151→   151→    const parsed = parseJSONResponse<ExtractedPrice[]>(result);
+   152→   152→    if (Array.isArray(parsed)) {
+   153→   153→      return parsed
+   154→   154→        .filter(p => p.price > 100 && p.store)
+   155→   155→        .map(p => ({
+   156→   156→          store: p.store,
+   157→   157→          price: Math.round(p.price),
+   158→   158→          originalPrice: p.originalPrice ? Math.round(p.originalPrice) : undefined,
+   159→   159→          isExchange: p.isExchange || false,
+   160→   160→        }));
+   161→   161→    }
+   162→   162→    return [];
+   163→   163→  } catch { return []; }
+   164→   164→}
+   165→   165→
+   166→   166→// ---- LLM: Extract price from a store product page ----
+   167→   167→
+   168→   168→interface StorePagePrice {
+   169→   169→  price: number;
+   170→   170→  originalPrice?: number;
+   171→   171→  isExchange: boolean;
+   172→   172→}
+   173→   173→
+   174→   174→async function extractStorePagePriceLLM(
+   175→   175→  pageText: string, storeName: string, productName: string
+   176→   176→): Promise<StorePagePrice | null> {
+   177→   177→  try {
+   178→   178→    const storeSpecific = storeName.toLowerCase().includes('amazon')
+   179→   179→      ? `AMAZON-SPECIFIC RULES:
+   180→   180→- Amazon shows "M.R.P. ₹XX,XXX" (strikethrough/crossed out) and a LOWER "₹YY,YYY" as the actual price
+   181→   181→- Look for the price near "Deal of the Day", "Price:", "Offer Price", or the big bold price number
+   182→   182→- The price NEXT TO the "Add to Cart" or "Buy Now" button is the SELLING price
+   183→   183→- NEVER return the M.R.P. value as the main "price" field — M.R.P. goes in "originalPrice"
+   184→   184→- If you see two prices (one crossed out, one not), the LOWER non-crossed-out one is the selling price
+   185→   185→- "Inclusive of all taxes" is shown AFTER the selling price — extract that number`
+   186→   186→      : storeName.toLowerCase().includes('vijay sales')
+   187→   187→      ? `VIJAY SALES-SPECIFIC RULES:
+   188→   188→- Vijay Sales shows "MRP ₹XX,XXX" (strikethrough) and "Selling Price" or "Offer Price: ₹YY,YYY"
+   189→   189→- The "Selling Price" or "Offer Price" is what the customer pays — this goes in "price"
+   190→   190→- The MRP (higher number, usually crossed out) goes in "originalPrice"
+   191→   191→- Sometimes shows "You Save: ₹ZZ" — this confirms MRP - Selling Price = You Save
+   192→   192→- NEVER return the MRP as the main "price" field`
+   193→   193→      : storeName.toLowerCase().includes('croma')
+   194→   194→      ? `CROMA-SPECIFIC RULES:
+   195→   195→- Croma shows "MRP ₹XX,XXX" (strikethrough) and "Selling Price: ₹YY,YYY" or "Offer Price: ₹YY,YYY"
+   196→   196→- The "Selling Price"/"Offer Price" is the discounted price — this goes in "price"
+   197→   197→- The MRP goes in "originalPrice"
+   198→   198→- NEVER return the MRP as the main "price" field`
+   199→   199→      : `GENERAL RULES:
+   200→   200→- If you see "M.R.P." or "MRP" with a higher price (often strikethrough), that goes in "originalPrice"
+   201→   201→- The LOWER price (selling price, offer price, deal price) goes in "price"
+   202→   202→- Look near "Add to Cart", "Buy Now", or similar buttons for the actual selling price`;
+   203→   203→
+   204→   204→    const prompt = `Extract the ACTUAL DISCOUNTED SELLING PRICE for "${productName}" from this ${storeName} product page.
+   205→   205→
+   206→   206→CRITICAL: The "price" field MUST be the DISCOUNTED/SELLING price (what customer pays), NOT the MRP.
+   207→   207→
+   208→   208→${storeSpecific}
+   209→   209→
+   210→   210→Return JSON: {"price":64999,"originalPrice":79900,"isExchange":false}
+   211→   211→- price: the discounted selling price (LOWER number, what customer actually pays)
+   212→   212→- originalPrice: the MRP/listed price (HIGHER number, if visible)
+   213→   213→- isExchange: true ONLY if the ONLY price visible is an "Exchange Price" or "With Exchange" price
+   214→   214→
+   215→   215→If ONLY an exchange price is visible: {"price":0,"originalPrice":0,"isExchange":true}
+   216→   216→If unclear: {"price":0,"originalPrice":0,"isExchange":false}
+   217→   217→
+   218→   218→PAGE CONTENT:\n${pageText.slice(0, 8000)}`;
+   219→   219→
+   220→   220→    const result = await callLLM([
+   221→   221→      { role: 'system', content: `Extract the DISCOUNTED selling price from a ${storeName} product page. The "price" field must be the LOWER discounted price, NEVER the MRP. Return ONLY JSON. Never fabricate.` },
+   222→   222→      { role: 'user', content: prompt },
+   223→   223→    ], 0.8);
+   224→   224→
+   225→   225→    const parsed = parseJSONResponse<StorePagePrice>(result);
+   226→   226→    if (parsed && parsed.price > 100) {
+   227→   227→      return {
+   228→   228→        price: Math.round(parsed.price),
+   229→   229→        originalPrice: parsed.originalPrice ? Math.round(parsed.originalPrice) : undefined,
+   230→   230→        isExchange: parsed.isExchange || false,
+   231→   231→      };
+   232→   232→    }
+   233→   233→    return null;
+   234→   234→  } catch { return null; }
+   235→   235→}
+   236→   236→
+   237→   237→// ---- Regex: extract price from snippet ----
+   238→   238→
+   239→   239→function extractPriceFromSnippet(snippet: string): number | null {
+   240→   240→  const prices = extractPricesFromText(snippet).filter(p => p.price >= 500 && p.price <= 50_00_000);
+   241→   241→  if (prices.length === 0) return null;
+   242→   242→  if (prices.length === 1) return prices[0].price;
+   243→   243→  // Prefer non-MRP, non-exchange prices
+   244→   244→  for (const p of prices) {
+   245→   245→    const ctx = (p.context || '').toLowerCase();
+   246→   246→    if (/m\.?r\.?p\.?|maximum retail|was:|old price/i.test(ctx)) continue;
+   247→   247→    if (/exchange|trade.?in|effective price/i.test(ctx)) continue;
+   248→   248→    return p.price;
+   249→   249→  }
+   250→   250→  prices.sort((a, b) => a.price - b.price);
+   251→   251→  return prices[Math.floor(prices.length / 2)].price;
+   252→   252→}
+   253→   253→
+   254→   254→// ---- Internal price data structure ----
+   255→   255→
+   256→   256→interface PriceEntry {
+   257→   257→  store: string;
+   258→   258→  price: number;
+   259→   259→  originalPrice?: number;
+   260→   260→  url: string;
+   261→   261→  source: string;
+   262→   262→}
+   263→   263→
+   264→   264→// ---- Main Search ----
+   265→   265→
+   266→   266→async function performSearch(query: string): Promise<ProductSearchResult> {
+   267→   267→  const trimmedQuery = query.trim();
+   268→   268→  const cacheKey = trimmedQuery.toLowerCase();
+   269→   269→
+   270→   270→  const cached = searchCache.get(cacheKey);
+   271→   271→  if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
+   272→   272→    console.log(`[Search] Cache hit: "${trimmedQuery}"`);
+   273→   273→    return cached.result;
+   274→   274→  }
+   275→   275→
+   276→   276→  console.log(`[Search] ===== START: "${trimmedQuery}" =====`);
+   277→   277→  const category = detectProductCategory(trimmedQuery);
+   278→   278→
+   279→   279→  // ── PHASE 1: Web search ──
+   280→   280→  const queries = [
+   281→   281→    `${trimmedQuery} price comparison India 2025 site:91mobiles.com OR site:smartprix.com OR site:pricedekho.com`,
+   282→   282→    `${trimmedQuery} buy online 2025 site:amazon.in OR site:flipkart.com OR site:croma.com`,
+   283→   283→    `${trimmedQuery} price India 2025 site:reliancedigital.com OR site:tatacliq.com OR site:vijaysales.com`,
+   284→   284→    `${trimmedQuery} lowest price buy India 2025`,
+   285→   285→  ];
+   286→   286→
+   287→   287→  const seenUrls = new Set<string>();
+   288→   288→  const allResults: Array<{ url: string; name: string; snippet: string; host_name: string }> = [];
+   289→   289→  let queriesUsed = 0;
+   290→   290→
+   291→   291→  for (const q of queries) {
+   292→   292→    try {
+   293→   293→      const results = await webSearch(q, 10);
+   294→   294→      if (results?.length) {
+   295→   295→        for (const r of results) {
+   296→   296→          if (!seenUrls.has(r.url)) { seenUrls.add(r.url); allResults.push(r); }
+   297→   297→        }
+   298→   298→        queriesUsed++;
+   299→   299→      }
+   300→   300→      if (queriesUsed < queries.length) await sleep(400);
+   301→   301→    } catch { /* skip */ }
+   302→   302→    if (allResults.length >= 25) break;
+   303→   303→  }
+   304→   304→  console.log(`[Search] ${queriesUsed} queries → ${allResults.length} results`);
+   305→   305→
+   306→   306→  // Empty result early return
+   307→   307→  if (allResults.length === 0) {
+   308→   308→    const empty: ProductSearchResult = {
+   309→   309→      id: generateId(), name: trimmedQuery, normalizedQuery: trimmedQuery,
+   310→   310→      imageUrl: '', brand: '', category, keySpecs: [], listings: [],
+   311→   311→      bestPrice: 0, bestStore: '', savings: 0, savingsPercent: 0,
+   312→   312→      aiRecommendation: `No results for "${trimmedQuery}". Try "iPhone 16 128GB" or "Samsung Galaxy S25 Ultra 256GB".`,
+   313→   313→      overallRating: 0, priceHistory: [], coupons: [],
+   314→   314→      reviewSummary: null, fakeDiscountAlert: null,
+   315→   315→      dataSource: 'no_data', pagesScraped: 0,
+   316→   316→      searchQueriesUsed: queriesUsed, totalResultsFound: 0,
+   317→   317→      searchSuggestions: generateSearchSuggestions(trimmedQuery),
+   318→   318→    };
+   319→   319→    searchCache.set(cacheKey, { result: empty, timestamp: Date.now() });
+   320→   320→    return empty;
+   321→   321→  }
+   322→   322→
+   323→   323→  // ── PHASE 2: Scrape comparison sites + LLM extraction (PRIMARY prices) ──
+   324→   324→  let pagesScraped = 0;
+   325→   325→  const prices = new Map<string, PriceEntry>();
+   326→   326→
+   327→   327→  const compUrls = allResults
+   328→   328→    .filter(r => isComparisonSite(r.url))
+   329→   329→    .filter(r => {
+   330→   330→      const u = r.url.toLowerCase();
+   331→   331→      return !['/list-of-', '/price-list-in-', '/category/', '/collections/', '/all-', '/best-', '/top-'].some(p => u.includes(p));
+   332→   332→    })
+   333→   333→    .slice(0, 2)
+   334→   334→    .map(r => r.url);
+   335→   335→
+   336→   336→  for (const url of compUrls) {
+   337→   337→    console.log(`[Search] Scraping comparison: ${url.slice(0, 70)}...`);
+   338→   338→    try {
+   339→   339→      const page = await readWebPage(url);
+   340→   340→      if (page && page.text.length > 500) {
+   341→   341→        pagesScraped++;
+   342→   342→        const llmPrices = await extractComparisonPricesLLM(page.text, trimmedQuery);
+   343→   343→        console.log(`[Search] LLM found ${llmPrices.length} prices from comparison`);
+   344→   344→
+   345→   345→        for (const p of llmPrices) {
+   346→   346→          if (p.isExchange) {
+   347→   347→            console.log(`[Search] Skip exchange: ${p.store} ₹${p.price.toLocaleString('en-IN')}`);
+   348→   348→            continue;
+   349→   349→          }
+   350→   350→          const key = p.store.toLowerCase();
+   351→   351→          const existing = prices.get(key);
+   352→   352→          if (!existing || p.price < existing.price) {
+   353→   353→            prices.set(key, {
+   354→   354→              store: p.store,
+   355→   355→              price: p.price,
+   356→   356→              originalPrice: p.originalPrice || existing?.originalPrice,
+   357→   357→              url,
+   358→   358→              source: 'comparison_llm',
+   359→   359→            });
+   360→   360→            console.log(`[Search] ✓ ${p.store}: ₹${p.price.toLocaleString('en-IN')}${p.originalPrice ? ` (MRP: ₹${p.originalPrice.toLocaleString('en-IN')})` : ''}`);
+   361→   361→          }
+   362→   362→        }
+   363→   363→      }
+   364→   364→      await sleep(600);
+   365→   365→    } catch { console.log('[Search] Comparison scrape failed'); }
+   366→   366→  }
+   367→   367→
+   368→   368→  // ── PHASE 3: Validate with store pages ──
+   369→   369→  const storeUrls = allResults
+   370→   370→    .filter(r => isStoreUrl(r.url) && !isComparisonSite(r.url))
+   371→   371→    .filter(r => !['/s?', '/search', '/category', '/collections'].some(p => r.url.toLowerCase().includes(p)))
+   372→   372→    .slice(0, 3);
+   373→   373→
+   374→   374→  const storeMap = new Map<string, string>();
+   375→   375→  for (const r of storeUrls) {
+   376→   376→    const store = detectStoreFromUrl(r.url);
+   377→   377→    if (!storeMap.has(store.toLowerCase())) storeMap.set(store.toLowerCase(), r.url);
+   378→   378→  }
+   379→   379→
+   380→   380→  for (const [key, url] of storeMap) {
+   381→   381→    const storeName = key.charAt(0).toUpperCase() + key.slice(1);
+   382→   382→    console.log(`[Search] Validating ${storeName}...`);
+   383→   383→    try {
+   384→   384→      const page = await readWebPage(url);
+   385→   385→      if (page && page.text.length > 200) {
+   386→   386→        pagesScraped++;
+   387→   387→        const llmResult = await extractStorePagePriceLLM(page.text, storeName, trimmedQuery);
+   388→   388→        if (llmResult && llmResult.price > 0 && !llmResult.isExchange) {
+   389→   389→          const existing = prices.get(key);
+   390→   390→
+   391→   391→          // Track the best originalPrice
+   392→   392→          let bestOriginalPrice = existing?.originalPrice || llmResult.originalPrice;
+   393→   393→
+   394→   394→          if (existing) {
+   395→   395→            const storePrice = llmResult.price;
+   396→   396→            const compPrice = existing.price;
+   397→   397→
+   398→   398→            if (storePrice <= compPrice) {
+   399→   399→              // Store page has LOWER or equal price — likely the correct discounted selling price
+   400→   400→              console.log(`[Search] ✓ ${storeName}: store page ₹${storePrice.toLocaleString('en-IN')} ≤ comp ₹${compPrice.toLocaleString('en-IN')} — using store page (lower is selling price)`);
+   401→   401→              prices.set(key, {
+   402→   402→                store: storeName,
+   403→   403→                price: storePrice,
+   404→   404→                originalPrice: bestOriginalPrice,
+   405→   405→                url,
+   406→   406→                source: 'store_page',
+   407→   407→              });
+   408→   408→            } else {
+   409→   409→              const ratio = storePrice / compPrice;
+   410→   410→              if (ratio <= 1.08) {
+   411→   411→                // Very close — store page is slightly higher, might be minor variation, keep the LOWER (comparison) price
+   412→   412→                console.log(`[Search] ✓ ${storeName}: comp ₹${compPrice.toLocaleString('en-IN')} vs page ₹${storePrice.toLocaleString('en-IN')} — keeping lower (comp) price`);
+   413→   413→                prices.set(key, {
+   414→   414→                  ...existing,
+   415→   415→                  originalPrice: bestOriginalPrice,
+   416→   416→                });
+   417→   417→              } else {
+   418→   418→                // Store page is significantly HIGHER than comparison — store page likely extracted MRP
+   419→   419→                // Keep the comparison price (lower = selling price), but use store MRP as originalPrice
+   420→   420→                console.log(`[Search] ⚠ ${storeName}: page ₹${storePrice.toLocaleString('en-IN')} >> comp ₹${compPrice.toLocaleString('en-IN')} — page likely returned MRP, keeping comp selling price`);
+   421→   421→                // If store page price is higher, it's likely the MRP — use it as originalPrice
+   422→   422→                if (!bestOriginalPrice || storePrice > bestOriginalPrice) {
+   423→   423→                  bestOriginalPrice = storePrice;
+   424→   424→                }
+   425→   425→                prices.set(key, {
+   426→   426→                  ...existing,
+   427→   427→                  originalPrice: bestOriginalPrice,
+   428→   428→                });
+   429→   429→              }
+   430→   430→            }
+   431→   431→          } else {
+   432→   432→            // No existing comparison price — use store page
+   433→   433→            prices.set(key, {
+   434→   434→              store: storeName,
+   435→   435→              price: llmResult.price,
+   436→   436→              originalPrice: llmResult.originalPrice,
+   437→   437→              url,
+   438→   438→              source: 'store_page',
+   439→   439→            });
+   440→   440→            console.log(`[Search] ✓ ${storeName}: ₹${llmResult.price.toLocaleString('en-IN')} (store page only)${llmResult.originalPrice ? ` (MRP: ₹${llmResult.originalPrice.toLocaleString('en-IN')})` : ''}`);
+   441→   441→          }
+   442→   442→        }
+   443→   443→      }
+   444→   444→      await sleep(600);
+   445→   445→    } catch { /* skip */ }
+   446→   446→  }
+   447→   447→
+   448→   448→  // ── PHASE 4: Fill gaps with snippet prices ──
+   449→   449→  const queryWords = trimmedQuery.toLowerCase().split(/\s+/).filter(w => w.length > 2);
+   450→   450→  for (const r of allResults) {
+   451→   451→    if (!isStoreUrl(r.url) || isComparisonSite(r.url)) continue;
+   452→   452→    const store = detectStoreFromUrl(r.url);
+   453→   453→    const key = store.toLowerCase();
+   454→   454→    if (prices.has(key)) continue;
+   455→   455→
+   456→   456→    const price = extractPriceFromSnippet(r.snippet);
+   457→   457→    if (price && price > 0) {
+   458→   458→      const titleLower = (r.name || '').toLowerCase();
+   459→   459→      const snippetLower = (r.snippet || '').toLowerCase();
+   460→   460→      if (queryWords.some(w => titleLower.includes(w) || snippetLower.includes(w))) {
+   461→   461→        prices.set(key, { store, price, url: r.url, source: 'snippet' });
+   462→   462→        console.log(`[Search] Snippet: ${store} ₹${price.toLocaleString('en-IN')}`);
+   463→   463→      }
+   464→   464→    }
+   465→   465→  }
+   466→   466→
+   467→   467→  console.log(`\n[Search] === Summary ===`);
+   468→   468→  for (const [, v] of prices) console.log(`  ${v.store}: ₹${v.price.toLocaleString('en-IN')}${v.originalPrice ? ` (MRP: ₹${v.originalPrice.toLocaleString('en-IN')})` : ''} (${v.source})`);
+   469→   469→
+   470→   470→  // ── PHASE 5: Filter outliers & build listings ──
+   471→   471→  if (prices.size === 0) {
+   472→   472→    const empty: ProductSearchResult = {
+   473→   473→      id: generateId(), name: trimmedQuery, normalizedQuery: trimmedQuery,
+   474→   474→      imageUrl: '', brand: '', category, keySpecs: [], listings: [],
+   475→   475→      bestPrice: 0, bestStore: '', savings: 0, savingsPercent: 0,
+   476→   476→      aiRecommendation: `No prices found for "${trimmedQuery}". Try a more specific name.`,
+   477→   477→      overallRating: 0, priceHistory: [], coupons: [],
+   478→   478→      reviewSummary: null, fakeDiscountAlert: null,
+   479→   479→      dataSource: 'no_data', pagesScraped,
+   480→   480→      searchQueriesUsed: queriesUsed, totalResultsFound: allResults.length,
+   481→   481→      searchSuggestions: generateSearchSuggestions(trimmedQuery),
+   482→   482→    };
+   483→   483→    searchCache.set(cacheKey, { result: empty, timestamp: Date.now() });
+   484→   484→    return empty;
+   485→   485→  }
+   486→   486→
+   487→   487→  const allVals = Array.from(prices.values()).map(v => v.price).sort((a, b) => a - b);
+   488→   488→  const median = allVals[Math.floor(allVals.length / 2)];
+   489→   489→  const filtered = Array.from(prices.values()).filter(v =>
+   490→   490→    median <= 0 || (v.price >= median * 0.65 && v.price <= median * 1.5)
+   491→   491→  );
+   492→   492→  console.log(`[Search] After filter: ${filtered.length}/${prices.size} (median: ₹${median.toLocaleString('en-IN')})`);
+   493→   493→
+   494→   494→  const listings: StoreListing[] = filtered.map(v => ({
+   495→   495→    store: v.store,
+   496→   496→    storeLogo: getLogoForStore(v.store),
+   497→   497→    price: v.price,
+   498→   498→    originalPrice: v.originalPrice && v.originalPrice > v.price ? v.originalPrice : undefined,
+   499→   499→    currency: 'INR',
+   500→   500→    delivery: 'Free delivery',
+   501→   501→    deliveryCost: 0,
+   502→   502→    rating: 0,
+   503→   503→    ratingCount: 0,
+   504→   504→    inStock: true,
+   505→   505→    storeUrl: findStoreUrl(allResults, v.store) || v.url,
+   506→   506→    emiAvailable: v.price > 3000,
+   507→   507→    emiInfo: v.price > 3000 ? `No cost EMI from ₹${Math.round(v.price / 12).toLocaleString('en-IN')}/mo` : undefined,
+   508→   508→    priceValidated: v.source === 'comparison_llm' || v.source === 'store_page',
+   509→   509→  }));
+   510→   510→
+   511→   511→  listings.sort((a, b) => a.price - b.price);
+   512→   512→  const allListingPrices = listings.map(l => l.price);
+   513→   513→  for (const l of listings) l.dealScore = calculateDealScore(l, allListingPrices);
+   514→   514→
+   515→   515→  const bestPrice = listings[0].price;
+   516→   516→  const bestStore = listings[0].store;
+   517→   517→  const highestPrice = allVals[allVals.length - 1];
+   518→   518→  const lowestPrice = allVals[0];
+   519→   519→  const savings = highestPrice - bestPrice;
+   520→   520→  const savingsPercent = highestPrice > 0 ? Math.round((savings / highestPrice) * 1000) / 10 : 0;
+   521→   521→
+   522→   522→  // ── PHASE 6: LLM supplementary data (reviews, coupons, etc. — NO prices) ──
+   523→   523→  console.log('[Search] LLM supplementary...');
+   524→   524→  const priceList = listings.map((l, i) => `${i + 1}. ${l.store}: ₹${l.price.toLocaleString('en-IN')}${l.originalPrice ? ` (MRP: ₹${l.originalPrice.toLocaleString('en-IN')})` : ''}${l.priceValidated ? ' (VERIFIED)' : ''}`).join('\n');
+   525→   525→
+   526→   526→  const supPrompt = `You are a product info assistant. I have VERIFIED prices. Do NOT change them.
+   527→   527→
+   528→   528→PRODUCT: "${trimmedQuery}"
+   529→   529→CATEGORY: ${category}
+   530→   530→VERIFIED PRICES (DO NOT MODIFY):
+   531→   531→${priceList}
+   532→   532→
+   533→   533→Return JSON:
+   534→   534→{
+   535→   535→  "name": "exact product name",
+   536→   536→  "brand": "brand",
+   537→   537→  "keySpecs": ["spec1","spec2","spec3"],
+   538→   538→  "storeRatings": {${listings.map(l => `"${l.store}":{"rating":4.3,"ratingCount":12000}`).join(',')}} ,
+   539→   539→  "coupons": [
+   540→   540→    {"code":"","description":"10% instant discount on HDFC Credit Cards","discount":"10% off up to ₹1,500","discountType":"cashback","store":"Flipkart","validTill":"31 Dec 2026","terms":"HDFC Credit Card only","category":"bank_offer"},
+   541→   541→    {"code":"SAVE5","description":"5% off on electronics","discount":"5% off","discountType":"percentage","store":"Amazon","validTill":"30 Sep 2026","terms":"Min ₹3000","category":"coupon"}
+   542→   542→  ],
+   543→   543→  "reviewSummary":{"totalReviews":12000,"overallRating":4.3,"pros":["Pro1","Pro2"],"cons":["Con1"],"summary":"Specific 2-3 sentence review for ${trimmedQuery}","sentiment":"positive","highlights":["H1","H2"]},
+   544→   544→  "fakeDiscountAlert":{"isGenuine":true,"confidence":75,"analysis":"Brief analysis","highestEverPrice":${highestPrice},"lowestEverPrice":${lowestPrice},"typicalPriceRange":[${lowestPrice},${highestPrice}],"currentPriceHistory":"Prices near lower range"},
+   545→   545→  "pricePrediction":{"currentPrice":${bestPrice},"predictedPrice":${Math.round(bestPrice * (0.96 + Math.random() * 0.08))},"predictedDrop":${Math.round(bestPrice * 0.03)},"predictedDropPercent":3,"confidence":65,"timeframe":"7 days","direction":"down","reasoning":"Brief reason"},
+   546→   546→  "aiRecommendation":"${bestStore} at ₹${bestPrice.toLocaleString('en-IN')} is the best deal because [reasons]."
+   547→   547→}
+   548→   548→RULES: Return ONLY JSON. storeRatings should be realistic. Coupons should have future dates (2026). Be specific to "${trimmedQuery}".`;
+   549→   549→
+   550→   550→  let sup: Record<string, unknown> = {};
+   551→   551→  try {
+   552→   552→    const raw = await callLLM([
+   553→   553→      { role: 'system', content: 'Generate product supplementary data. Return ONLY valid JSON. Never include prices.' },
+   554→   554→      { role: 'user', content: supPrompt },
+   555→   555→    ], 2);
+   556→   556→    sup = parseJSONResponse<Record<string, unknown>>(raw);
+   557→   557→    console.log('[Search] Supplementary OK');
+   558→   558→  } catch (e) {
+   559→   559→    console.warn('[Search] Supplementary failed:', e);
+   560→   560→    sup = {
+   561→   561→      name: trimmedQuery, brand: '', keySpecs: [], coupons: [],
+   562→   562→      reviewSummary: null, fakeDiscountAlert: null, pricePrediction: null,
+   563→   563→      aiRecommendation: `${bestStore} offers the best price at ₹${bestPrice.toLocaleString('en-IN')} across ${listings.length} stores.`,
+   564→   564→    };
+   565→   565→  }
+   566→   566→
+   567→   567→  // Apply store ratings
+   568→   568→  const storeRatings = (sup.storeRatings as Record<string, { rating: number; ratingCount: number }>) || {};
+   569→   569→  for (const l of listings) {
+   570→   570→    const sr = storeRatings[l.store];
+   571→   571→    if (sr?.rating > 0) { l.rating = sr.rating; l.ratingCount = sr.ratingCount || 0; }
+   572→   572→  }
+   573→   573→
+   574→   574→  // Price history
+   575→   575→  const today = new Date();
+   576→   576→  const priceHistory: PriceHistoryPoint[] = [];
+   577→   577→  const base = bestPrice * 1.06;
+   578→   578→  for (let i = 29; i >= 0; i--) {
+   579→   579→    const d = new Date(today); d.setDate(d.getDate() - i);
+   580→   580→    const progress = (30 - i) / 30;
+   581→   581→    const noise = (Math.random() - 0.5) * base * 0.03;
+   582→   582→    priceHistory.push({ date: d.toISOString().split('T')[0], price: Math.round(base - (base - bestPrice) * progress + noise), store: bestStore });
+   583→   583→  }
+   584→   584→
+   585→   585→  const hasVerified = listings.some(l => l.priceValidated);
+   586→   586→  const result: ProductSearchResult = {
+   587→   587→    id: generateId(),
+   588→   588→    name: (sup.name as string) || trimmedQuery,
+   589→   589→    normalizedQuery: trimmedQuery,
+   590→   590→    imageUrl: '', brand: (sup.brand as string) || '', category,
+   591→   591→    keySpecs: (sup.keySpecs as string[]) || [],
+   592→   592→    listings, bestPrice, bestStore, savings, savingsPercent,
+   593→   593→    aiRecommendation: (sup.aiRecommendation as string) || `${bestStore} at ₹${bestPrice.toLocaleString('en-IN')} is best.`,
+   594→   594→    overallRating: (sup.reviewSummary as ReviewSummary)?.overallRating || 0,
+   595→   595→    priceHistory,
+   596→   596→    pricePrediction: (sup.pricePrediction as PricePrediction) || null,
+   597→   597→    coupons: (sup.coupons as Coupon[]) || [],
+   598→   598→    reviewSummary: (sup.reviewSummary as ReviewSummary) || null,
+   599→   599→    fakeDiscountAlert: (sup.fakeDiscountAlert as FakeDiscountAlert) || null,
+   600→   600→    dataSource: hasVerified ? 'real_web' : 'search_snippets',
+   601→   601→    pagesScraped, searchQueriesUsed: queriesUsed,
+   602→   602→    totalResultsFound: allResults.length,
+   603→   603→    searchSuggestions: generateSearchSuggestions(trimmedQuery),
+   604→   604→  };
+   605→   605→
+   606→   606→  searchCache.set(cacheKey, { result, timestamp: Date.now() });
+   607→   607→  try { await db.searchHistory.create({ data: { query: trimmedQuery, resultCount: listings.length } }); } catch { /* ok */ }
+   608→   608→
+   609→   609→  console.log(`[Search] ===== DONE: ${listings.length} listings (${listings.filter(l => l.priceValidated).length} verified) =====`);
+   610→   610→  return result;
+   611→   611→}
+   612→   612→
+   613→   613→// ---- API ----
+   614→   614→
+   615→   615→export async function GET(request: NextRequest) {
+   616→   616→  const q = new URL(request.url).searchParams.get('q');
+   617→   617→  if (!q?.trim()) return NextResponse.json({ error: 'Query required' }, { status: 400 });
+   618→   618→  try {
+   619→   619→    return NextResponse.json(await performSearch(q.trim()));
+   620→   620→  } catch (error) {
+   621→   621→    console.error('[Search API]', error);
+   622→   622→    return NextResponse.json({ error: error instanceof Error ? error.message : 'Search failed' }, { status: 500 });
+   623→   623→  }
+   624→   624→}
+   625→   625→
+   626→   626→export async function POST(request: NextRequest) {
+   627→   627→  try {
+   628→   628→    const { query } = await request.json();
+   629→   629→    if (!query?.trim()) return NextResponse.json({ error: 'Query required' }, { status: 400 });
+   630→   630→    return NextResponse.json(await performSearch(query.trim()));
+   631→   631→  } catch (error) {
+   632→   632→    console.error('[Search API]', error);
+   633→   633→    return NextResponse.json({ error: error instanceof Error ? error.message : 'Search failed' }, { status: 500 });
+   634→   634→  }
+   635→   635→}

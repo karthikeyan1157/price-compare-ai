@@ -1,0 +1,48 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  name      String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model SearchHistory {
+  id        String   @id @default(cuid())
+  query     String
+  resultCount Int    @default(0)
+  createdAt DateTime @default(now())
+}
+
+model WishlistItem {
+  id           String   @id @default(cuid())
+  productName  String
+  productKey   String
+  store        String
+  price        Float
+  currency     String   @default("INR")
+  imageUrl     String?
+  storeUrl     String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
+
+model PriceAlert {
+  id          String   @id @default(cuid())
+  productName String
+  targetPrice Float
+  currentPrice Float
+  currency    String   @default("INR")
+  email       String?
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
