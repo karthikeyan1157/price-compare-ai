@@ -35,7 +35,7 @@ cat > .z-ai-config <<'EOF'
 {
   "baseUrl": "https://generativelanguage.googleapis.com/v1beta/openai",
   "apiKey": "${GEMINI_API_KEY}",
-  "model": "gemini-2.5-flash"
+  "model": "gemini-2.0-flash"
 }
 EOF
 echo "  ✓ .z-ai-config created (gitignored — your key stays private)"
@@ -43,7 +43,7 @@ echo "  ✓ .z-ai-config created (gitignored — your key stays private)"
 # 4. Test the Gemini key
 echo ""
 echo "[4/6] Testing your Gemini API key..."
-RESPONSE=$(curl -s -w "\n%{http_code}" "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}" \
+RESPONSE=$(curl -s -w "\n%{http_code}" "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}" \
   -H "Content-Type: application/json" \
   -d '{"contents":[{"parts":[{"text":"Say OK"}]}],"generationConfig":{"thinkingConfig":{"thinkingBudget":0}}}' 2>/dev/null || echo -e "\n000")
 HTTP_CODE=$(echo "$RESPONSE" | tail -1)

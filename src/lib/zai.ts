@@ -40,7 +40,7 @@ export let isApiKeyInvalid = false;
 if (process.env.GEMINI_API_KEY) {
   CONFIG = {
     apiKey: process.env.GEMINI_API_KEY,
-    model: process.env.GEMINI_MODEL || 'gemini-2.5-flash',
+    model: process.env.GEMINI_MODEL || 'gemini-2.0-flash',
     baseUrl: process.env.GEMINI_BASEURL,
   };
 } else {
@@ -48,7 +48,7 @@ if (process.env.GEMINI_API_KEY) {
   CONFIG = loadConfig();
 }
 
-const GEMINI_MODEL = CONFIG?.model || "gemini-2.5-flash";
+const GEMINI_MODEL = CONFIG?.model || "gemini-2.0-flash";
 
 const GEMINI_NATIVE_BASE =
   "https://generativelanguage.googleapis.com/v1beta";

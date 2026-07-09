@@ -20,7 +20,7 @@ Your Gemini API key is pre-configured in `.z-ai-config`:
 {
   "baseUrl": "https://generativelanguage.googleapis.com/v1beta/openai",
   "apiKey": "YOUR_KEY",
-  "model": "gemini-2.5-flash"
+  "model": "gemini-2.0-flash"
 }
 ```
 

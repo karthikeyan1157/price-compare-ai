@@ -41,7 +41,7 @@ cp .z-ai-config.example .z-ai-config
 {
   "baseUrl": "https://generativelanguage.googleapis.com/v1beta/openai",
   "apiKey": "Your_API_Key",
-  "model": "gemini-2.5-flash"
+  "model": "gemini-2.0-flash"
 }
 ```
 
@@ -125,7 +125,7 @@ Then open http://localhost:3000
 → Your Gemini free tier is exhausted. Either:
 - Enable billing on your Google Cloud project (pay-as-you-go)
 - Wait for the quota to reset (daily reset for free tier)
-- Try a different model: change `"model": "gemini-2.5-flash"` to `"gemini-1.5-flash"` or `"gemini-2.0-flash"` in `.z-ai-config`
+- Try a different model: change `"model": "gemini-2.0-flash"` to `"gemini-1.5-flash"` or `"gemini-2.5-flash"` in `.z-ai-config`
 
 ### "403 Forbidden" / "API key not valid"
 → Your API key is wrong or expired. Get a new one at https://aistudio.google.com/apikey
