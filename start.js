@@ -8,7 +8,7 @@ process.on('unhandledRejection', (reason) => {
   process.exit(1);
 });
 
-process.env.HOSTNAME = process.env.HOSTNAME || '0.0.0.0';
+process.env.HOSTNAME = '0.0.0.0';
 const path = require('path');
 const serverPath = path.join(__dirname, '.next', 'standalone', 'server.js');
 try {
