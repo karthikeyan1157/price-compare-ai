@@ -510,21 +510,19 @@ async function performSearch(query: string): Promise<ProductSearchResult> {
   const allResults: Array<{ url: string; name: string; snippet: string; host_name: string }> = [];
   let queriesUsed = 0;
 
-  for (const q of queries) {
-    try {
-      const results = await webSearch(q, 10);
-      if (results?.length) {
-        for (const r of results) {
-          if (!seenUrls.has(r.url)) { seenUrls.add(r.url); allResults.push(r); }
-        }
-        queriesUsed++;
-      }
-      if (queriesUsed < queries.length) await sleep(2000); // 2s spacing between search query calls
-    } catch { /* skip */ }
+  const queryPromises = queries.map(q => webSearch(q, 10).catch(() => []));
+  const resultsArray = await Promise.all(queryPromises);
 
-    // If we have retrieved files/info from at least first 2 queries (comparison sites & primary stores) 
-    // and have enough results, save API quota by breaking early
-    if (queriesUsed >= 2 && allResults.length >= 12) break;
+  for (const results of resultsArray) {
+    if (results?.length) {
+      for (const r of results) {
+        if (!seenUrls.has(r.url)) {
+          seenUrls.add(r.url);
+          allResults.push(r);
+        }
+      }
+      queriesUsed++;
+    }
   }
   console.log(`[Search] ${queriesUsed} queries → ${allResults.length} results`);
 

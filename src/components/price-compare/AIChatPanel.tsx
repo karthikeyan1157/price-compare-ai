@@ -69,20 +69,23 @@ export default function AIChatPanel() {
         body: JSON.stringify({ message: msg, history: chatMessages.slice(-10) }),
       });
 
-      if (!res.ok) throw new Error('Failed to get response');
+      const data = await res.json().catch(() => ({}));
 
-      const data = await res.json();
-      const content = data?.message || data?.content || '';
-
-      if (content) {
-        updateChatMessage(assistantMsg.id, content);
+      if (!res.ok) {
+        const err = data?.error || 'Failed to get response from server';
+        updateChatMessage(assistantMsg.id, `Error: ${err}`);
       } else {
-        updateChatMessage(
-          assistantMsg.id,
-          "I'm sorry, I couldn't process that. Could you try rephrasing your question?",
-        );
+        const content = data?.message || data?.content || '';
+        if (content) {
+          updateChatMessage(assistantMsg.id, content);
+        } else {
+          updateChatMessage(
+            assistantMsg.id,
+            "I'm sorry, I couldn't process that. Could you try rephrasing your question?",
+          );
+        }
       }
-    } catch {
+    } catch (e) {
       updateChatMessage(
         assistantMsg.id,
         "Sorry, I'm having trouble connecting. Please try again in a moment.",

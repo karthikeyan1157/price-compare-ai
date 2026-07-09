@@ -12,7 +12,7 @@ interface GeminiConfig {
   model?: string;
 }
 
-function loadConfig(): GeminiConfig | null {
+export function loadConfig(): GeminiConfig | null {
   const homeDir = os.homedir();
   const candidates = [
     path.join(process.cwd(), '.z-ai-config'),
@@ -34,13 +34,17 @@ function loadConfig(): GeminiConfig | null {
 }
 let CONFIG: GeminiConfig | null = null;
 
-if (process.env.NODE_ENV === "development") {
-    CONFIG = loadConfig();
+// Prefer explicit environment variables in production, but fall back to a
+// project-root or system `.z-ai-config` file if the env var is not present.
+if (process.env.GEMINI_API_KEY) {
+  CONFIG = {
+    apiKey: process.env.GEMINI_API_KEY,
+    model: process.env.GEMINI_MODEL || 'gemini-2.5-flash',
+    baseUrl: process.env.GEMINI_BASEURL,
+  };
 } else {
-    CONFIG = {
-        apiKey: process.env.GEMINI_API_KEY,
-        model: process.env.GEMINI_MODEL || "gemini-2.5-flash",
-    };
+  // try to load from .z-ai-config (project root, home, or /etc)
+  CONFIG = loadConfig();
 }
 
 const GEMINI_MODEL = CONFIG?.model || "gemini-2.5-flash";
@@ -49,21 +53,23 @@ const GEMINI_NATIVE_BASE =
   "https://generativelanguage.googleapis.com/v1beta";
 
 if (CONFIG?.apiKey) {
-    console.log("[AI] Provider: Gemini | model:", GEMINI_MODEL);
+  console.log("[AI] Provider: Gemini | model:", GEMINI_MODEL);
 } else {
-    console.warn(
-        "[AI] Gemini API key not found. Configure GEMINI_API_KEY."
-    );
+  console.warn(
+    "[AI] Gemini API key not found. Configure GEMINI_API_KEY."
+  );
 }
-if (CONFIG?.apiKey) {
-  console.log('[AI] Provider: Gemini | model:', CONFIG.model);
-} else {
-  console.warn('[AI] No .z-ai-config found — AI features will fail.');
-}
-
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
+
+class NonRetryableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'NonRetryableError';
+  }
+}
+
 
 // =====================
 // LLM
@@ -88,9 +94,11 @@ export async function callLLM(
   maxRetries: number = 2,
   options?: LLMOptions
 ): Promise<string> {
+  const CANNED_ASSISTANT_RESPONSE = `I don't have access to live AI services right now. I can still help with general advice: describe the product (brand, model or features) and I will suggest what to look for, typical price ranges, and buying tips.`;
+
   if (!CONFIG?.apiKey) {
-    console.warn('[AI] Gemini API key not configured — returning empty response');
-    return '';
+    console.warn('[AI] Gemini API key not configured — returning canned assistant response');
+    return CANNED_ASSISTANT_RESPONSE;
   }
 
   const url = `${GEMINI_NATIVE_BASE}/models/${CONFIG.model}:generateContent?key=${CONFIG.apiKey}`;
@@ -125,7 +133,7 @@ export async function callLLM(
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
-        signal: AbortSignal.timeout(60000),
+        signal: AbortSignal.timeout(10000),
       });
 
       if (!res.ok) {
@@ -137,7 +145,7 @@ export async function callLLM(
           await sleep(delay);
           continue;
         }
-        throw new Error(`Gemini LLM ${res.status}: ${errText.slice(0, 400)}`);
+        throw new NonRetryableError(`Gemini LLM ${res.status}: ${errText.slice(0, 400)}`);
       }
 
       const data = await res.json();
@@ -152,14 +160,20 @@ export async function callLLM(
       if (!text) throw new Error('Gemini returned empty text');
       return text;
     } catch (error) {
+      if (error instanceof NonRetryableError) {
+        console.error('[AI] callLLM failed (non-retryable):', error.message);
+        return CANNED_ASSISTANT_RESPONSE;
+      }
       if (attempt < maxRetries) {
         await sleep(1500 * (attempt + 1));
         continue;
       }
-      throw error;
+      console.error('[AI] callLLM failed after retries:', error);
+      // Return canned response rather than throwing so chat still works
+      return CANNED_ASSISTANT_RESPONSE;
     }
   }
-  throw new Error('Gemini LLM call failed after retries');
+  return CANNED_ASSISTANT_RESPONSE;
 }
 
 // =====================
@@ -213,12 +227,15 @@ export async function webSearch(
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(45000),
+      signal: AbortSignal.timeout(10000),
     });
 
     if (!res.ok) {
       const errText = await res.text();
       console.error(`[WebSearch] HTTP ${res.status}: ${errText.slice(0, 300)}`);
+      if (res.status === 400 || res.status === 401 || res.status === 403 || res.status === 404) {
+        return [];
+      }
       return await duckduckgoSearch(query, numResults);
     }
 
@@ -322,7 +339,7 @@ export async function duckduckgoSearch(
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.9',
       },
-      signal: AbortSignal.timeout(15000),
+      signal: AbortSignal.timeout(5000),
     });
 
     if (!response.ok) {
@@ -406,7 +423,7 @@ export async function bingSearch(
         'Referer': 'https://www.bing.com/',
         'DNT': '1',
       },
-      signal: AbortSignal.timeout(15000),
+      signal: AbortSignal.timeout(5000),
     });
 
     if (!response.ok) {
@@ -522,7 +539,7 @@ export async function readWebPage(url: string): Promise<WebPage | null> {
         'Accept-Encoding': 'gzip, deflate, br',
       },
       redirect: 'follow',
-      signal: AbortSignal.timeout(15000),
+      signal: AbortSignal.timeout(5000),
     });
 
     if (!res.ok) {

@@ -122,7 +122,15 @@ IMPORTANT: Use the real prices and information above in your response. If the us
       messages.push({ role: 'user', content: trimmedMessage });
     }
 
-    const response = await callLLM(messages, 2, { useSearch: true });
+    const response = await callLLM(messages, 2, { useSearch: false });
+
+    if (!response || response.trim().length === 0) {
+      console.warn('[Chat API] LLM returned empty response — check GEMINI_API_KEY');
+      return NextResponse.json(
+        { error: 'AI provider not configured or returned no response. Configure GEMINI_API_KEY.' },
+        { status: 503 }
+      );
+    }
 
     return NextResponse.json({ message: response });
   } catch (error) {
