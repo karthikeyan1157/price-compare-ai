@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { callLLM, webSearch, readWebPage, isApiKeyInvalid } from '@/lib/zai';
+import { callLLM, webSearch, readWebPage, isApiKeyInvalid, isApiKeyQuotaExceeded } from '@/lib/zai';
 
 export const runtime = 'nodejs';
 export const maxDuration = 30;
@@ -127,6 +127,12 @@ IMPORTANT: Use the real prices and information above in your response. If the us
     if (isApiKeyInvalid) {
       return NextResponse.json({
         message: "⚠️ API Authentication Error: The configured \`GEMINI_API_KEY\` is invalid or unauthenticated (returned HTTP 401). Please update the API key in your Render Dashboard settings."
+      });
+    }
+
+    if (isApiKeyQuotaExceeded) {
+      return NextResponse.json({
+        message: "⚠️ API Quota Error: Your Google Gemini API Key has exceeded rate limits (returned HTTP 429). Google restricts free-tier API keys on cloud hosts like Render. Please enable pay-as-you-go billing on Google AI Studio to use the chat assistant."
       });
     }
 

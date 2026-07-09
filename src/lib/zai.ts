@@ -34,6 +34,7 @@ export function loadConfig(): GeminiConfig | null {
 }
 let CONFIG: GeminiConfig | null = null;
 export let isApiKeyInvalid = false;
+export let isApiKeyQuotaExceeded = false;
 
 // Prefer explicit environment variables in production, but fall back to a
 // project-root or system `.z-ai-config` file if the env var is not present.
@@ -142,6 +143,9 @@ export async function callLLM(
         if (res.status === 401 || res.status === 403) {
           isApiKeyInvalid = true;
         }
+        if (res.status === 429) {
+          isApiKeyQuotaExceeded = true;
+        }
         const is429 = res.status === 429;
         if (attempt < maxRetries && (is429 || res.status >= 500)) {
           const delay = is429 ? 6000 * (attempt + 1) : 2000;
@@ -241,6 +245,10 @@ export async function webSearch(
         if (res.status === 401 || res.status === 403) {
           isApiKeyInvalid = true;
         }
+        return [];
+      }
+      if (res.status === 429) {
+        isApiKeyQuotaExceeded = true;
         return [];
       }
       return await duckduckgoSearch(query, numResults);

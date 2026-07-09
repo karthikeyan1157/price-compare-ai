@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
-import { callLLM, webSearch, readWebPage, parseJSONResponse, isApiKeyInvalid } from '@/lib/zai';
+import { callLLM, webSearch, readWebPage, parseJSONResponse, isApiKeyInvalid, isApiKeyQuotaExceeded } from '@/lib/zai';
 import { extractPricesFromText, calculateDealScore, detectProductCategory, generateSearchSuggestions } from '@/lib/price-engine';
 import { crawlProductPrices } from '@/lib/seo-crawler';
 import type {
@@ -534,7 +534,9 @@ async function performSearch(query: string): Promise<ProductSearchResult> {
       bestPrice: 0, bestStore: '', savings: 0, savingsPercent: 0,
       aiRecommendation: isApiKeyInvalid
         ? `Error: Your GEMINI_API_KEY is invalid or unauthenticated (HTTP 401). Please configure a valid Google Gemini API key in your Render Dashboard settings.`
-        : `No results for "${trimmedQuery}". Try "iPhone 16 128GB" or "Samsung Galaxy S25 Ultra 256GB".`,
+        : isApiKeyQuotaExceeded
+          ? `Error: Your GEMINI_API_KEY has exceeded its free tier rate limit or daily quota (HTTP 429). Google restricts free Gemini API keys when called from cloud hosting providers like Render. Please enable pay-as-you-go billing in Google AI Studio to unlock unrestricted access.`
+          : `No results for "${trimmedQuery}". Try "iPhone 16 128GB" or "Samsung Galaxy S25 Ultra 256GB".`,
       overallRating: 0, priceHistory: [], coupons: [],
       reviewSummary: null, fakeDiscountAlert: null,
       dataSource: 'no_data', pagesScraped: 0,
