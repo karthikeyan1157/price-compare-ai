@@ -34,7 +34,7 @@ echo "[3/6] Creating .z-ai-config with your Gemini key..."
 cat > .z-ai-config <<'EOF'
 {
   "baseUrl": "https://generativelanguage.googleapis.com/v1beta/openai",
-  "apiKey": ${GEMINI_API_KEY},
+  "apiKey": "${GEMINI_API_KEY}",
   "model": "gemini-2.5-flash"
 }
 EOF

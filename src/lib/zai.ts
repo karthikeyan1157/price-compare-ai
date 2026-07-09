@@ -32,13 +32,31 @@ function loadConfig(): GeminiConfig | null {
   }
   return null;
 }
+let CONFIG: GeminiConfig | null = null;
 
-const CONFIG = loadConfig();
-const GEMINI_MODEL = CONFIG?.model || 'gemini-2.5-flash';
-const GEMINI_NATIVE_BASE = 'https://generativelanguage.googleapis.com/v1beta';
+if (process.env.NODE_ENV === "development") {
+    CONFIG = loadConfig();
+} else {
+    CONFIG = {
+        apiKey: process.env.GEMINI_API_KEY,
+        model: process.env.GEMINI_MODEL || "gemini-2.5-flash",
+    };
+}
+
+const GEMINI_MODEL = CONFIG?.model || "gemini-2.5-flash";
+
+const GEMINI_NATIVE_BASE =
+  "https://generativelanguage.googleapis.com/v1beta";
 
 if (CONFIG?.apiKey) {
-  console.log('[AI] Provider: Gemini | model:', GEMINI_MODEL);
+    console.log("[AI] Provider: Gemini | model:", GEMINI_MODEL);
+} else {
+    console.warn(
+        "[AI] Gemini API key not found. Configure GEMINI_API_KEY."
+    );
+}
+if (CONFIG?.apiKey) {
+  console.log('[AI] Provider: Gemini | model:', CONFIG.model);
 } else {
   console.warn('[AI] No .z-ai-config found — AI features will fail.');
 }
@@ -71,10 +89,11 @@ export async function callLLM(
   options?: LLMOptions
 ): Promise<string> {
   if (!CONFIG?.apiKey) {
-    throw new Error('Gemini config missing apiKey in .z-ai-config');
+    console.warn('[AI] Gemini API key not configured — returning empty response');
+    return '';
   }
 
-  const url = `${GEMINI_NATIVE_BASE}/models/${GEMINI_MODEL}:generateContent?key=${CONFIG.apiKey}`;
+  const url = `${GEMINI_NATIVE_BASE}/models/${CONFIG.model}:generateContent?key=${CONFIG.apiKey}`;
 
   // Split system vs chat messages
   const systemText = messages
