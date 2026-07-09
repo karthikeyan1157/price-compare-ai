@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { callLLM, webSearch, readWebPage } from '@/lib/zai';
+import { callLLM, webSearch, readWebPage, isApiKeyInvalid } from '@/lib/zai';
 
 export const runtime = 'nodejs';
 export const maxDuration = 30;
@@ -123,6 +123,12 @@ IMPORTANT: Use the real prices and information above in your response. If the us
     }
 
     const response = await callLLM(messages, 2, { useSearch: false });
+
+    if (isApiKeyInvalid) {
+      return NextResponse.json({
+        message: "⚠️ API Authentication Error: The configured \`GEMINI_API_KEY\` is invalid or unauthenticated (returned HTTP 401). Please update the API key in your Render Dashboard settings."
+      });
+    }
 
     if (!response || response.trim().length === 0) {
       console.warn('[Chat API] LLM returned empty response — check GEMINI_API_KEY');

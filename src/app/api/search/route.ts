@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
-import { callLLM, webSearch, readWebPage, parseJSONResponse } from '@/lib/zai';
+import { callLLM, webSearch, readWebPage, parseJSONResponse, isApiKeyInvalid } from '@/lib/zai';
 import { extractPricesFromText, calculateDealScore, detectProductCategory, generateSearchSuggestions } from '@/lib/price-engine';
 import { crawlProductPrices } from '@/lib/seo-crawler';
 import type {
@@ -532,7 +532,9 @@ async function performSearch(query: string): Promise<ProductSearchResult> {
       id: generateId(), name: trimmedQuery, normalizedQuery: trimmedQuery,
       imageUrl: '', brand: '', category, keySpecs: [], listings: [],
       bestPrice: 0, bestStore: '', savings: 0, savingsPercent: 0,
-      aiRecommendation: `No results for "${trimmedQuery}". Try "iPhone 16 128GB" or "Samsung Galaxy S25 Ultra 256GB".`,
+      aiRecommendation: isApiKeyInvalid
+        ? `Error: Your GEMINI_API_KEY is invalid or unauthenticated (HTTP 401). Please configure a valid Google Gemini API key in your Render Dashboard settings.`
+        : `No results for "${trimmedQuery}". Try "iPhone 16 128GB" or "Samsung Galaxy S25 Ultra 256GB".`,
       overallRating: 0, priceHistory: [], coupons: [],
       reviewSummary: null, fakeDiscountAlert: null,
       dataSource: 'no_data', pagesScraped: 0,
