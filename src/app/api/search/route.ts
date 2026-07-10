@@ -225,6 +225,7 @@ interface ExtractedPrice {
   price: number;
   originalPrice?: number;
   isExchange: boolean;
+  inStock?: boolean;
 }
 
 async function extractComparisonPricesLLM(
@@ -376,7 +377,7 @@ async function extractPricesFromSnippetsLLM(
     }));
 
     const result = await callLLM([
-      { role: 'system', content: 'Extract product name, price, seller, and discount from the given search results. Return only JSON array.' },
+      { role: 'system', content: 'Extract product name, price, seller, discount, and stock availability (in stock or out of stock) from the given search results. Return only JSON array.' },
       { role: 'user', content: JSON.stringify(rawResults) },
     ], 2);
 
@@ -403,11 +404,18 @@ async function extractPricesFromSnippetsLLM(
             }
           }
 
+          let inStock = true;
+          const availability = (p.availability || p.stock || p.stockStatus || '').toLowerCase();
+          if (availability.includes('out') || availability.includes('sold') || availability.includes('unavail')) {
+            inStock = false;
+          }
+
           return {
             store,
             price: Math.round(price),
             originalPrice: originalPrice ? Math.round(originalPrice) : undefined,
             isExchange: false,
+            inStock,
           };
         })
         .filter(p => p.price > 100 && p.store);
@@ -440,16 +448,18 @@ For each store where you found a REAL price, provide:
 - "originalPrice": the MRP (the HIGHER crossed-out number) — only if different from price
 - "sourceUrl": the EXACT URL of the store product page where you found this price
 - "isExchange": false (only true if the price is an exchange/trade-in price)
+- "inStock": true (or false if the product is explicitly out of stock / sold out / unavailable at this store)
 
 CRITICAL RULES:
-- You MUST include a real sourceUrl for every price — if you can't find a URL, don't include that store
+- You MUST include a real sourceUrl for every price — if you can't find a URL, don't include that store. The sourceUrl must be a real store product page URL from the search results.
 - "price" is NEVER the MRP — MRP goes in "originalPrice"
 - Ignore EMI monthly amounts (₹X/month), exchange prices, and "starting from" prices
 - If you only found the price on a comparison site (not the actual store), still include it with the comparison site URL
-- Return [] if you found NO real prices with URLs
+- Return [] if you found NO real prices with URLs. The sourceUrl must be a real store product page URL from the search results.
+- Do NOT output the example prices/stores below under any circumstances. They are just for format representation.
 
 Return ONLY a JSON array:
-[{"store":"Amazon","price":79990,"originalPrice":79990,"isExchange":false,"sourceUrl":"https://www.amazon.in/dp/B0XXXXX"},{"store":"Flipkart","price":78990,"originalPrice":84990,"isExchange":false,"sourceUrl":"https://www.flipkart.com/product/p/itmXXXXX"}]`;
+[{"store":"Store Name","price":12345,"originalPrice":15999,"isExchange":false,"inStock":true,"sourceUrl":"https://www.store.com/product-url"}]`;
 
     const result = await callLLM([
       { role: 'system', content: 'You are a price comparison assistant. You MUST search the web for real current prices using Google Search. Never report prices from memory — only prices you actually found in search results. Every price MUST have a sourceUrl. Return ONLY a JSON array.' },
@@ -465,6 +475,7 @@ Return ONLY a JSON array:
           price: Math.round(p.price),
           originalPrice: p.originalPrice ? Math.round(p.originalPrice) : undefined,
           isExchange: p.isExchange || false,
+          inStock: p.inStock !== false,
           sourceUrl: p.sourceUrl,
         }));
     }
@@ -483,6 +494,7 @@ interface PriceEntry {
   originalPrice?: number;
   url: string;
   source: string;
+  inStock?: boolean;
 }
 
 // ---- Main Search ----
@@ -579,6 +591,7 @@ async function performSearch(query: string): Promise<ProductSearchResult> {
       originalPrice: p.originalPrice,
       url: matchingUrl?.url || '',
       source: 'snippet_llm',
+      inStock: p.inStock,
     });
     console.log(`[Search] ✓ ${p.store}: ₹${p.price.toLocaleString('en-IN')}${p.originalPrice ? ` (MRP: ₹${p.originalPrice.toLocaleString('en-IN')})` : ''} (snippet_llm)`);
   }
@@ -605,6 +618,7 @@ async function performSearch(query: string): Promise<ProductSearchResult> {
       originalPrice: p.originalPrice,
       url: p.sourceUrl || '',
       source: 'direct_gemini',
+      inStock: p.inStock,
     });
     console.log(`[Search] ✓ ${p.store}: ₹${p.price.toLocaleString('en-IN')}${p.originalPrice ? ` (MRP: ₹${p.originalPrice.toLocaleString('en-IN')})` : ''} (direct_gemini)`);
   }
@@ -761,7 +775,9 @@ async function performSearch(query: string): Promise<ProductSearchResult> {
       });
 
       if (isRelevant) {
-        prices.set(key, { store, price, url: r.url, source: 'snippet' });
+        const text = `${r.name} ${r.snippet}`.toLowerCase();
+        const snippetInStock = !/\b(out of stock|sold out|temp(?:orarily)? unavailable|currently unavailable)\b/i.test(text);
+        prices.set(key, { store, price, url: r.url, source: 'snippet', inStock: snippetInStock });
         console.log(`[Search] Snippet: ${store} ₹${price.toLocaleString('en-IN')}`);
       }
     }
@@ -816,22 +832,40 @@ async function performSearch(query: string): Promise<ProductSearchResult> {
   );
   console.log(`[Search] After filter: ${filtered.length}/${prices.size} (median: ₹${median.toLocaleString('en-IN')})`);
 
-  const listings: StoreListing[] = filtered.map(v => ({
-    store: v.store,
-    storeLogo: getLogoForStore(v.store),
-    price: v.price,
-    originalPrice: v.originalPrice && v.originalPrice > v.price ? v.originalPrice : undefined,
-    currency: 'INR',
-    delivery: 'Free delivery',
-    deliveryCost: 0,
-    rating: 0,
-    ratingCount: 0,
-    inStock: true,
-    storeUrl: (!isPlaceholderOrComparisonUrl(v.url) ? v.url : null) || findStoreUrl(allResults, v.store) || getStoreFallbackSearchUrl(v.store, trimmedQuery),
-    emiAvailable: v.price > 3000,
-    emiInfo: v.price > 3000 ? `No cost EMI from ₹${Math.round(v.price / 12).toLocaleString('en-IN')}/mo` : undefined,
-    priceValidated: v.source === 'comparison_llm' || v.source === 'store_page' || v.source === 'direct_gemini' || v.source === 'snippet_llm',
-  }));
+  const listings: StoreListing[] = filtered.map(v => {
+    let matchingInStock = v.inStock;
+    if (matchingInStock === undefined) {
+      matchingInStock = true;
+      const matchingUrl = allResults.find(r => {
+        const rStore = detectStoreFromUrl(r.url).toLowerCase();
+        const vStore = v.store.toLowerCase();
+        return rStore === vStore || rStore.includes(vStore) || vStore.includes(rStore);
+      });
+      if (matchingUrl) {
+        const text = `${matchingUrl.name} ${matchingUrl.snippet}`.toLowerCase();
+        if (/\b(out of stock|sold out|temp(?:orarily)? unavailable|currently unavailable)\b/i.test(text)) {
+          matchingInStock = false;
+        }
+      }
+    }
+
+    return {
+      store: v.store,
+      storeLogo: getLogoForStore(v.store),
+      price: v.price,
+      originalPrice: v.originalPrice && v.originalPrice > v.price ? v.originalPrice : undefined,
+      currency: 'INR',
+      delivery: 'Free delivery',
+      deliveryCost: 0,
+      rating: 0,
+      ratingCount: 0,
+      inStock: matchingInStock,
+      storeUrl: (!isPlaceholderOrComparisonUrl(v.url) ? v.url : null) || findStoreUrl(allResults, v.store) || getStoreFallbackSearchUrl(v.store, trimmedQuery),
+      emiAvailable: v.price > 3000,
+      emiInfo: v.price > 3000 ? `No cost EMI from ₹${Math.round(v.price / 12).toLocaleString('en-IN')}/mo` : undefined,
+      priceValidated: v.source === 'comparison_llm' || v.source === 'store_page' || v.source === 'direct_gemini' || v.source === 'snippet_llm',
+    };
+  });
 
   listings.sort((a, b) => a.price - b.price);
   const allListingPrices = listings.map(l => l.price);
