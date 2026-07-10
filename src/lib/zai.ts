@@ -32,33 +32,70 @@ export function loadConfig(): GeminiConfig | null {
   }
   return null;
 }
-let CONFIG: GeminiConfig | null = null;
-export let isApiKeyInvalid = false;
-export let isApiKeyQuotaExceeded = false;
-
-// Prefer explicit environment variables in production, but fall back to a
-// project-root or system `.z-ai-config` file if the env var is not present.
-if (process.env.GEMINI_API_KEY) {
-  CONFIG = {
-    apiKey: process.env.GEMINI_API_KEY,
-    model: process.env.GEMINI_MODEL || 'gemini-2.0-flash',
-    baseUrl: process.env.GEMINI_BASEURL,
-  };
-} else {
-  // try to load from .z-ai-config (project root, home, or /etc)
-  CONFIG = loadConfig();
-}
-
-const GEMINI_MODEL = CONFIG?.model || "gemini-2.0-flash";
-
 const GEMINI_NATIVE_BASE =
   "https://generativelanguage.googleapis.com/v1beta";
 
-if (CONFIG?.apiKey) {
-  console.log("[AI] Provider: Gemini | model:", GEMINI_MODEL);
+const invalidKeys = new Set<string>();
+const quotaExceededKeys = new Set<string>();
+
+export let isApiKeyInvalid = false;
+export let isApiKeyQuotaExceeded = false;
+
+let cachedConfig: GeminiConfig | null = null;
+let lastConfigLoadTime = 0;
+const CONFIG_CACHE_TTL = 5000; // 5 seconds cache to avoid disk reads on rapid successive requests
+
+export function getGeminiConfig(): GeminiConfig | null {
+  const now = Date.now();
+  if (cachedConfig && (now - lastConfigLoadTime < CONFIG_CACHE_TTL)) {
+    return cachedConfig;
+  }
+
+  let cfg: GeminiConfig | null = null;
+  if (process.env.GEMINI_API_KEY) {
+    cfg = {
+      apiKey: process.env.GEMINI_API_KEY,
+      model: process.env.GEMINI_MODEL || 'gemini-2.0-flash',
+      baseUrl: process.env.GEMINI_BASEURL,
+    };
+  } else {
+    cfg = loadConfig();
+  }
+
+  cachedConfig = cfg;
+  lastConfigLoadTime = now;
+  return cfg;
+}
+
+export function updateApiKeyFlags(apiKey?: string, state?: 'success' | 'invalid' | 'quota_exceeded') {
+  if (!apiKey) {
+    isApiKeyInvalid = false;
+    isApiKeyQuotaExceeded = false;
+    return;
+  }
+  if (state === 'success') {
+    invalidKeys.delete(apiKey);
+    quotaExceededKeys.delete(apiKey);
+  } else if (state === 'invalid') {
+    invalidKeys.add(apiKey);
+  } else if (state === 'quota_exceeded') {
+    quotaExceededKeys.add(apiKey);
+  }
+  isApiKeyInvalid = invalidKeys.has(apiKey);
+  isApiKeyQuotaExceeded = quotaExceededKeys.has(apiKey);
+}
+
+// Log initial status safely
+const initialConfig = getGeminiConfig();
+if (initialConfig?.apiKey) {
+  if (initialConfig.apiKey.startsWith('gsk_')) {
+    console.log("[AI] Provider: Groq (OpenAI compat) | model:", initialConfig.model || 'llama-3.1-8b-instant');
+  } else {
+    console.log("[AI] Provider: Gemini | model:", initialConfig.model || 'gemini-2.0-flash');
+  }
 } else {
   console.warn(
-    "[AI] Gemini API key not found. Configure GEMINI_API_KEY."
+    "[AI] Gemini / Groq API key not found. Configure GEMINI_API_KEY."
   );
 }
 function sleep(ms: number): Promise<void> {
@@ -98,12 +135,81 @@ export async function callLLM(
 ): Promise<string> {
   const CANNED_ASSISTANT_RESPONSE = `I don't have access to live AI services right now. I can still help with general advice: describe the product (brand, model or features) and I will suggest what to look for, typical price ranges, and buying tips.`;
 
-  if (!CONFIG?.apiKey) {
-    console.warn('[AI] Gemini API key not configured — returning canned assistant response');
+  const config = getGeminiConfig();
+  if (!config?.apiKey) {
+    console.warn('[AI] API key not configured — returning canned assistant response');
     return CANNED_ASSISTANT_RESPONSE;
   }
 
-  const url = `${GEMINI_NATIVE_BASE}/models/${CONFIG.model}:generateContent?key=${CONFIG.apiKey}`;
+  updateApiKeyFlags(config.apiKey);
+
+  const isGroq = config.apiKey.startsWith('gsk_');
+
+  if (isGroq) {
+    const model = config.model || 'llama-3.1-8b-instant';
+    const url = 'https://api.groq.com/openai/v1/chat/completions';
+    const payload = {
+      model: model,
+      messages: messages.map((m) => ({
+        role: m.role,
+        content: m.content,
+      })),
+      temperature: 0.7,
+    };
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${config.apiKey}`,
+          },
+          body: JSON.stringify(payload),
+          signal: AbortSignal.timeout(10000),
+        });
+
+        if (!res.ok) {
+          const errText = await res.text();
+          if (res.status === 401 || res.status === 403) {
+            updateApiKeyFlags(config.apiKey, 'invalid');
+          }
+          if (res.status === 429) {
+            updateApiKeyFlags(config.apiKey, 'quota_exceeded');
+          }
+          const is429 = res.status === 429;
+          if (attempt < maxRetries && (is429 || res.status >= 500)) {
+            const delay = is429 ? 6000 * (attempt + 1) : 2000;
+            console.warn(`[LLM/Groq] ${res.status} (attempt ${attempt + 1}), retry in ${delay}ms`);
+            await sleep(delay);
+            continue;
+          }
+          throw new NonRetryableError(`Groq LLM ${res.status}: ${errText.slice(0, 400)}`);
+        }
+
+        updateApiKeyFlags(config.apiKey, 'success');
+        const data = await res.json();
+        const text = data?.choices?.[0]?.message?.content?.trim();
+        if (!text) throw new Error('Groq returned empty text');
+        return text;
+      } catch (error) {
+        if (error instanceof NonRetryableError) {
+          console.error('[AI] callLLM (Groq) failed (non-retryable):', error.message);
+          return CANNED_ASSISTANT_RESPONSE;
+        }
+        if (attempt < maxRetries) {
+          await sleep(1500 * (attempt + 1));
+          continue;
+        }
+        console.error('[AI] callLLM (Groq) failed after retries:', error);
+        return CANNED_ASSISTANT_RESPONSE;
+      }
+    }
+    return CANNED_ASSISTANT_RESPONSE;
+  }
+
+  const model = config.model || 'gemini-2.0-flash';
+  const url = `${GEMINI_NATIVE_BASE}/models/${model}:generateContent?key=${config.apiKey}`;
 
   // Split system vs chat messages
   const systemText = messages
@@ -141,10 +247,10 @@ export async function callLLM(
       if (!res.ok) {
         const errText = await res.text();
         if (res.status === 401 || res.status === 403) {
-          isApiKeyInvalid = true;
+          updateApiKeyFlags(config.apiKey, 'invalid');
         }
         if (res.status === 429) {
-          isApiKeyQuotaExceeded = true;
+          updateApiKeyFlags(config.apiKey, 'quota_exceeded');
         }
         const is429 = res.status === 429;
         if (attempt < maxRetries && (is429 || res.status >= 500)) {
@@ -156,6 +262,7 @@ export async function callLLM(
         throw new NonRetryableError(`Gemini LLM ${res.status}: ${errText.slice(0, 400)}`);
       }
 
+      updateApiKeyFlags(config.apiKey, 'success');
       const data = await res.json();
       const parts = data?.candidates?.[0]?.content?.parts;
       if (!Array.isArray(parts)) {
@@ -206,12 +313,21 @@ export async function webSearch(
   query: string,
   numResults: number = 10
 ): Promise<SearchResult[]> {
-  if (!CONFIG?.apiKey) {
+  const config = getGeminiConfig();
+  if (!config?.apiKey) {
     console.error('[WebSearch] No API key configured');
     return [];
   }
 
-  const url = `${GEMINI_NATIVE_BASE}/models/${GEMINI_MODEL}:generateContent?key=${CONFIG.apiKey}`;
+  updateApiKeyFlags(config.apiKey);
+
+  if (config.apiKey.startsWith('gsk_')) {
+    console.log(`[WebSearch] Groq key detected ("${query.slice(0, 40)}...") -> falling back to multi-engine search`);
+    return await multiEngineSearch(query, numResults);
+  }
+
+  const model = config.model || 'gemini-2.0-flash';
+  const url = `${GEMINI_NATIVE_BASE}/models/${model}:generateContent?key=${config.apiKey}`;
 
   const payload = {
     contents: [
@@ -243,17 +359,18 @@ export async function webSearch(
       console.error(`[WebSearch] HTTP ${res.status}: ${errText.slice(0, 300)}`);
       if (res.status === 400 || res.status === 401 || res.status === 403 || res.status === 404) {
         if (res.status === 401 || res.status === 403) {
-          isApiKeyInvalid = true;
+          updateApiKeyFlags(config.apiKey, 'invalid');
         }
         return [];
       }
       if (res.status === 429) {
-        isApiKeyQuotaExceeded = true;
+        updateApiKeyFlags(config.apiKey, 'quota_exceeded');
         return [];
       }
       return await duckduckgoSearch(query, numResults);
     }
 
+    updateApiKeyFlags(config.apiKey, 'success');
     const data = await res.json();
     const candidate = data?.candidates?.[0];
     if (!candidate) {

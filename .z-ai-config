@@ -1,5 +1,0 @@
-{
-  "baseUrl": "https://generativelanguage.googleapis.com/v1beta/openai",
-  "apiKey": "AQ.Ab8RN6IBudCS1FEH6ICBPUBaebFwNb9UIwuNtbOS-d-heWoy1w",
-  "model": "gemini-2.5-flash"
-}
