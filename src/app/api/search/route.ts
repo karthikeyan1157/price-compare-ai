@@ -369,46 +369,48 @@ async function extractPricesFromSnippetsLLM(
   productName: string
 ): Promise<ExtractedPrice[]> {
   try {
-    // Build a compact text blob of all search results
-    const blob = results
-      .slice(0, 20)
-      .map((r, i) => {
-        const store = detectStoreFromUrl(r.url);
-        return `[${i + 1}] ${r.name}\n    Store: ${store} (${r.host_name})\n    Snippet: ${r.snippet}\n    URL: ${r.url}`;
-      })
-      .join('\n\n');
-
-    const prompt = `You are a price extraction expert for Indian e-commerce. Extract ACTUAL SELLING PRICES for "${productName}" from these search results.
-
-CRITICAL RULES:
-1. "price" = the DISCOUNTED/SELLING price (what customer pays) — the LOWER number
-2. "originalPrice" = the MRP/listed price (the HIGHER number, often with strikethrough) — OPTIONAL
-3. NEVER use MRP as the main "price" — MRP goes in "originalPrice" only
-4. Only extract prices you actually see in the text — do NOT guess or fabricate
-5. "store" must be the store name (Amazon, Flipkart, Croma, Reliance Digital, Vijay Sales, Tata CLiQ, etc.)
-6. Ignore exchange prices, EMI-per-month prices, and "starting from" prices
-7. If a snippet mentions "PS5 Pro ₹79,990" with no store name but the URL is amazon.in, store = Amazon
-
-Known Indian stores: Amazon, Flipkart, Croma, Reliance Digital, Tata CLiQ, Vijay Sales, Snapdeal, Myntra, Ajio, Paytm Mall, Poorvika, ShopClues, Mi Store, OnePlus Store, Samsung, Apple
-
-Return JSON array of prices found: [{"store":"Amazon","price":79990,"originalPrice":79990,"isExchange":false}]
-If no prices found in any snippet: []`;
+    const rawResults = results.map(r => ({
+      title: r.name,
+      url: r.url,
+      content: r.snippet
+    }));
 
     const result = await callLLM([
-      { role: 'system', content: 'Extract real selling prices from Indian e-commerce search snippets. Return ONLY a JSON array. Never fabricate prices — only use prices explicitly mentioned in the text.' },
-      { role: 'user', content: `${prompt}\n\nSEARCH RESULTS:\n${blob.slice(0, 12000)}` },
+      { role: 'system', content: 'Extract product name, price, seller, and discount from the given search results. Return only JSON array.' },
+      { role: 'user', content: JSON.stringify(rawResults) },
     ], 2);
 
-    const parsed = parseJSONResponse<ExtractedPrice[]>(result);
+    const parsed = parseJSONResponse<any[]>(result);
     if (Array.isArray(parsed)) {
       return parsed
-        .filter(p => p.price > 100 && p.store)
-        .map(p => ({
-          store: p.store,
-          price: Math.round(p.price),
-          originalPrice: p.originalPrice ? Math.round(p.originalPrice) : undefined,
-          isExchange: p.isExchange || false,
-        }));
+        .map(p => {
+          const store = p.seller || p.store || '';
+          let price = 0;
+          if (typeof p.price === 'number') {
+            price = p.price;
+          } else if (typeof p.price === 'string') {
+            price = parseFloat(p.price.replace(/[^\d.]/g, ''));
+          }
+
+          let originalPrice: number | undefined = undefined;
+          if (p.originalPrice) {
+            originalPrice = typeof p.originalPrice === 'number' ? p.originalPrice : parseFloat(p.originalPrice.replace(/[^\d.]/g, ''));
+          } else if (p.discount && price > 0) {
+            const pctMatch = p.discount.match(/(\d+)%\s*off/i);
+            if (pctMatch) {
+              const pct = parseFloat(pctMatch[1]);
+              originalPrice = Math.round(price / (1 - pct / 100));
+            }
+          }
+
+          return {
+            store,
+            price: Math.round(price),
+            originalPrice: originalPrice ? Math.round(originalPrice) : undefined,
+            isExchange: false,
+          };
+        })
+        .filter(p => p.price > 100 && p.store);
     }
     return [];
   } catch (e) {
@@ -498,12 +500,9 @@ async function performSearch(query: string): Promise<ProductSearchResult> {
   console.log(`[Search] ===== START: "${trimmedQuery}" =====`);
   const category = detectProductCategory(trimmedQuery);
 
-  // ── PHASE 1: Web search ──
+  // ── PHASE 1: Web search (optimized single query for Tavily in India) ──
   const queries = [
-    `${trimmedQuery} price comparison India 2025 site:91mobiles.com OR site:smartprix.com OR site:pricedekho.com`,
-    `${trimmedQuery} buy online 2025 site:amazon.in OR site:flipkart.com OR site:croma.com`,
-    `${trimmedQuery} price India 2025 site:reliancedigital.com OR site:tatacliq.com OR site:vijaysales.com`,
-    `${trimmedQuery} lowest price buy India 2025`,
+    `${trimmedQuery} price site:amazon.in OR site:flipkart.com OR site:croma.com OR site:reliancedigital.in OR site:vijaysales.com OR site:tatacliq.com`
   ];
 
   const seenUrls = new Set<string>();

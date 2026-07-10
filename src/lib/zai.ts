@@ -10,6 +10,7 @@ interface GeminiConfig {
   baseUrl?: string;
   apiKey?: string;
   model?: string;
+  provider?: 'gemini' | 'groq';
 }
 
 export function loadConfig(): GeminiConfig | null {
@@ -52,14 +53,38 @@ export function getGeminiConfig(): GeminiConfig | null {
   }
 
   let cfg: GeminiConfig | null = null;
-  if (process.env.GEMINI_API_KEY) {
+  const provider = (process.env.AI_PROVIDER || '').toLowerCase();
+
+  if (provider === 'groq' || process.env.GROQ_API_KEY) {
     cfg = {
-      apiKey: process.env.GEMINI_API_KEY,
-      model: process.env.GEMINI_MODEL || 'gemini-2.0-flash',
+      apiKey: process.env.GROQ_API_KEY || process.env.GEMINI_API_KEY,
+      model: process.env.GROQ_MODEL || process.env.GEMINI_MODEL || 'llama-3.1-8b-instant',
+      baseUrl: process.env.GROQ_BASEURL || process.env.GEMINI_BASEURL,
+      provider: 'groq',
+    };
+  } else if (process.env.GEMINI_API_KEY) {
+    const apiKey = process.env.GEMINI_API_KEY;
+    const isGroq = apiKey.startsWith('gsk_') || (process.env.GEMINI_MODEL || '').includes('llama');
+    cfg = {
+      apiKey: apiKey,
+      model: process.env.GEMINI_MODEL || (isGroq ? 'llama-3.1-8b-instant' : 'gemini-2.0-flash'),
       baseUrl: process.env.GEMINI_BASEURL,
+      provider: isGroq ? 'groq' : 'gemini',
     };
   } else {
-    cfg = loadConfig();
+    const loaded = loadConfig();
+    if (loaded) {
+      const isGroq = loaded.apiKey?.startsWith('gsk_') || loaded.model?.includes('llama');
+      cfg = {
+        ...loaded,
+        provider: isGroq ? 'groq' : 'gemini',
+      };
+    }
+  }
+
+  if (cfg && !cfg.provider) {
+    const isGroq = cfg.apiKey?.startsWith('gsk_') || cfg.model?.includes('llama');
+    cfg.provider = isGroq ? 'groq' : 'gemini';
   }
 
   cachedConfig = cfg;
@@ -88,14 +113,14 @@ export function updateApiKeyFlags(apiKey?: string, state?: 'success' | 'invalid'
 // Log initial status safely
 const initialConfig = getGeminiConfig();
 if (initialConfig?.apiKey) {
-  if (initialConfig.apiKey.startsWith('gsk_')) {
+  if (initialConfig.provider === 'groq') {
     console.log("[AI] Provider: Groq (OpenAI compat) | model:", initialConfig.model || 'llama-3.1-8b-instant');
   } else {
     console.log("[AI] Provider: Gemini | model:", initialConfig.model || 'gemini-2.0-flash');
   }
 } else {
   console.warn(
-    "[AI] Gemini / Groq API key not found. Configure GEMINI_API_KEY."
+    "[AI] Gemini / Groq API key not found. Configure GEMINI_API_KEY or GROQ_API_KEY."
   );
 }
 function sleep(ms: number): Promise<void> {
@@ -143,14 +168,51 @@ export async function callLLM(
 
   updateApiKeyFlags(config.apiKey);
 
-  const isGroq = config.apiKey.startsWith('gsk_');
+  const isGroq = config.provider === 'groq' || config.apiKey.startsWith('gsk_') || (config.model || '').includes('llama');
+
+  let enhancedMessages = [...messages];
+  if (options?.useSearch) {
+    const lastMsgContent = messages[messages.length - 1]?.content || '';
+    let searchQuery = '';
+    const match = lastMsgContent.match(/current selling price of "([^"]+)"/i) ||
+      lastMsgContent.match(/search the web for:\s*(.+)/i) ||
+      lastMsgContent.match(/selling price of "([^"]+)"/i);
+    if (match) {
+      searchQuery = match[1];
+    } else {
+      searchQuery = lastMsgContent.slice(0, 100);
+    }
+
+    console.log(`[LLM Grounding] Querying Tavily for grounding: "${searchQuery}"`);
+    const searchResults = await tavilySearch(searchQuery, 5);
+    if (searchResults.length > 0) {
+      const contextStr = searchResults
+        .map((r, idx) => `[Result ${idx + 1}] Source: ${r.name} (${r.url})\nSnippet: ${r.snippet}`)
+        .join('\n\n');
+
+      const searchContextPrompt = `\n\nREAL-TIME WEB DATA (Tavily):\n${contextStr}\n\nUse this real-time web data to formulate your response. Cite the prices and source URLs accurately.`;
+
+      const systemMsgIdx = enhancedMessages.findIndex(m => m.role === 'system');
+      if (systemMsgIdx !== -1) {
+        enhancedMessages[systemMsgIdx] = {
+          ...enhancedMessages[systemMsgIdx],
+          content: enhancedMessages[systemMsgIdx].content + searchContextPrompt,
+        };
+      } else {
+        enhancedMessages.unshift({
+          role: 'system',
+          content: 'Use this real-time web data to formulate your response:' + searchContextPrompt,
+        });
+      }
+    }
+  }
 
   if (isGroq) {
     const model = config.model || 'llama-3.1-8b-instant';
     const url = 'https://api.groq.com/openai/v1/chat/completions';
     const payload = {
       model: model,
-      messages: messages.map((m) => ({
+      messages: enhancedMessages.map((m) => ({
         role: m.role,
         content: m.content,
       })),
@@ -212,11 +274,11 @@ export async function callLLM(
   const url = `${GEMINI_NATIVE_BASE}/models/${model}:generateContent?key=${config.apiKey}`;
 
   // Split system vs chat messages
-  const systemText = messages
+  const systemText = enhancedMessages
     .filter((m) => m.role === 'system')
     .map((m) => m.content)
     .join('\n\n');
-  const chatMessages = messages.filter((m) => m.role !== 'system');
+  const chatMessages = enhancedMessages.filter((m) => m.role !== 'system');
 
   const payload: Record<string, unknown> = {
     contents: chatMessages.map((m) => ({
@@ -230,9 +292,6 @@ export async function callLLM(
   };
   if (systemText) {
     payload.systemInstruction = { parts: [{ text: systemText }] };
-  }
-  if (options?.useSearch) {
-    payload.tools = [{ google_search: {} }];
   }
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
@@ -292,7 +351,7 @@ export async function callLLM(
 }
 
 // =====================
-// Web Search (via Gemini Google Search grounding)
+// Web Search (via Tavily)
 // =====================
 
 export interface SearchResult {
@@ -306,143 +365,96 @@ export interface SearchResult {
 }
 
 /**
- * Web search via Gemini Google Search grounding.
- * Uses the same Gemini API key — no separate search API needed.
+ * Web search via Tavily API.
  */
-export async function webSearch(
+export async function tavilySearch(
   query: string,
   numResults: number = 10
 ): Promise<SearchResult[]> {
-  const config = getGeminiConfig();
-  if (!config?.apiKey) {
-    console.error('[WebSearch] No API key configured');
+  const apiKey = process.env.TAVILY_API_KEY || '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';
+  if (!apiKey) {
+    console.error('[Tavily] No API key configured');
     return [];
   }
 
-  updateApiKeyFlags(config.apiKey);
-
-  if (config.apiKey.startsWith('gsk_')) {
-    console.log(`[WebSearch] Groq key detected ("${query.slice(0, 40)}...") -> falling back to multi-engine search`);
-    return await multiEngineSearch(query, numResults);
-  }
-
-  const model = config.model || 'gemini-2.0-flash';
-  const url = `${GEMINI_NATIVE_BASE}/models/${model}:generateContent?key=${config.apiKey}`;
-
-  const payload = {
-    contents: [
-      {
-        parts: [
-          {
-            text: `Search the web for: ${query}\n\nList the most relevant web pages found. For each page, include its URL, title, and a brief snippet of what the page contains.`,
-          },
-        ],
-      },
-    ],
-    tools: [{ google_search: {} }],
-    generationConfig: {
-      temperature: 0,
-      thinkingConfig: { thinkingBudget: 0 },
-    },
-  };
-
   try {
-    const res = await fetch(url, {
+    const url = 'https://api.tavily.com/search';
+    const response = await fetch(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(10000),
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        api_key: apiKey,
+        query: query,
+        max_results: numResults,
+        include_answer: true,
+      }),
+      signal: AbortSignal.timeout(8000),
     });
 
-    if (!res.ok) {
-      const errText = await res.text();
-      console.error(`[WebSearch] HTTP ${res.status}: ${errText.slice(0, 300)}`);
-      if (res.status === 400 || res.status === 401 || res.status === 403 || res.status === 404) {
-        if (res.status === 401 || res.status === 403) {
-          updateApiKeyFlags(config.apiKey, 'invalid');
-        }
-        return [];
-      }
-      if (res.status === 429) {
-        updateApiKeyFlags(config.apiKey, 'quota_exceeded');
-        return [];
-      }
-      return await duckduckgoSearch(query, numResults);
+    if (!response.ok) {
+      const errText = await response.text();
+      console.error(`[Tavily] HTTP ${response.status}: ${errText.slice(0, 300)}`);
+      return [];
     }
 
-    updateApiKeyFlags(config.apiKey, 'success');
-    const data = await res.json();
-    const candidate = data?.candidates?.[0];
-    if (!candidate) {
-      console.warn('[WebSearch] No candidates in response');
-      return await duckduckgoSearch(query, numResults);
-    }
-
-    // Extract grounding chunks (URLs + titles)
-    const groundingMetadata = candidate.groundingMetadata || {};
-    const chunks: Array<{ web?: { uri?: string; title?: string } }> =
-      groundingMetadata.groundingChunks || [];
-
-    // Extract grounding supports (snippets associated with chunk indices)
-    const supports: Array<{
-      groundingChunkIndices?: number[];
-      segment?: { text?: string };
-    }> = groundingMetadata.groundingSupports || [];
-
-    // Build snippet map: chunk index → concatenated snippet text
-    const snippetMap = new Map<number, string>();
-    for (const support of supports) {
-      const indices = support.groundingChunkIndices || [];
-      const text = support.segment?.text || '';
-      for (const idx of indices) {
-        const existing = snippetMap.get(idx) || '';
-        snippetMap.set(idx, existing ? existing + ' ' + text : text);
-      }
-    }
-
-    // Also capture the model's text response — it often summarizes prices
-    const modelText = (candidate.content?.parts || [])
-      .map((p: { text?: string }) => p.text || '')
-      .join(' ')
-      .trim();
-
+    const data = await response.json();
     const results: SearchResult[] = [];
-    for (let i = 0; i < chunks.length && results.length < numResults; i++) {
-      const web = chunks[i]?.web;
-      if (!web?.uri) continue;
+    const tavilyResults: any[] = data.results || [];
+
+    for (let i = 0; i < tavilyResults.length; i++) {
+      const r = tavilyResults[i];
+      if (!r.url) continue;
       let host = '';
       try {
-        host = new URL(web.uri).hostname.replace(/^www\./, '');
+        host = new URL(r.url).hostname.replace(/^www\./, '');
       } catch {
         /* skip */
       }
       results.push({
-        url: web.uri,
-        name: web.title || host || '',
-        snippet: (snippetMap.get(i) || '').slice(0, 500),
+        url: r.url,
+        name: r.title || host || '',
+        snippet: r.content || '',
         host_name: host,
         rank: i,
       });
     }
 
-    // Add the model's text response as a synthetic result so the LLM
-    // snippet extraction phase can parse prices from it.
-    if (modelText && modelText.length > 20) {
+    // Add synthetic summary if available (expected by the price parser engine)
+    if (data.answer && data.answer.length > 20) {
       results.push({
-        url: 'https://google-search-grounding.synthetic',
+        url: 'https://tavily-search.synthetic',
         name: `AI Search Summary: ${query.slice(0, 60)}`,
-        snippet: modelText.slice(0, 1000),
-        host_name: 'google.com',
+        snippet: data.answer.slice(0, 1000),
+        host_name: 'tavily.com',
         rank: results.length,
       });
     }
 
-    console.log(`[WebSearch] "${query.slice(0, 50)}..." → ${results.length} results${modelText ? ' (+AI summary)' : ''}`);
+    console.log(`[Tavily] "${query.slice(0, 50)}..." → ${results.length} results`);
     return results;
   } catch (e) {
-    console.error('[WebSearch] Failed:', e instanceof Error ? e.message : e);
-    return await duckduckgoSearch(query, numResults);
+    console.error('[Tavily] Search failed:', e instanceof Error ? e.message : e);
+    return [];
   }
+}
+
+/**
+ * Main web search entrypoint. Routes search queries to Tavily.
+ */
+export async function webSearch(
+  query: string,
+  numResults: number = 10
+): Promise<SearchResult[]> {
+  console.log(`[WebSearch] Using Tavily for: "${query.slice(0, 50)}..."`);
+  const tavilyResults = await tavilySearch(query, numResults);
+  if (tavilyResults.length > 0) {
+    return tavilyResults;
+  }
+
+  console.log(`[WebSearch] Tavily returned 0 results -> falling back to multi-engine search`);
+  return await multiEngineSearch(query, numResults);
 }
 
 function simplifyQueryForDDG(query: string): string {
